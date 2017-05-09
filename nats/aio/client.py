@@ -12,6 +12,7 @@ from nats.protocol.parser import *
 
 __version__ = '0.4.0'
 __lang__ = 'python3'
+PROTOCOL = 1
 
 INFO_OP = b'INFO'
 CONNECT_OP = b'CONNECT'
@@ -73,6 +74,7 @@ class Srv(object):
         self.reconnects = 0
         self.last_attempt = None
         self.did_connect = False
+        self.discovered = False
 
 
 class Client(object):
@@ -466,6 +468,21 @@ class Client(object):
             return None
 
     @property
+    def servers(self):
+        servers = []
+        for srv in self._server_pool:
+            servers.append(srv)
+        return servers
+
+    @property
+    def discovered_servers(self):
+        servers = []
+        for srv in self._server_pool:
+            if srv.discovered:
+                servers.append(srv)
+        return servers
+
+    @property
     def max_payload(self):
         """
         Returns the max payload which we received from the servers INFO
@@ -685,7 +702,8 @@ class Client(object):
             "verbose": self.options["verbose"],
             "pedantic": self.options["pedantic"],
             "lang": __lang__,
-            "version": __version__
+            "version": __version__,
+            "protocol": PROTOCOL
         }
         if "auth_required" in self._server_info:
             if self._server_info["auth_required"]:
@@ -779,60 +797,79 @@ class Client(object):
         self._server_info = json.loads(info.decode())
         self._max_payload = self._server_info["max_payload"]
 
-        if self._server_info['tls_required']:
-            ssl_context = self.options.get('tls')
-            if not ssl_context:
-                raise NatsError('no ssl context provided')
+        if 'connect_urls' in self._server_info:
+          if self._server_info['connect_urls']:
+              connect_urls = []
+              for connect_url in self._server_info['connect_urls']:
+                  uri = urlparse("nats://%s" % connect_url)
+                  srv = Srv(uri)
+                  srv.discovered = True
 
-            transport = self._io_writer.transport
-            sock = transport.get_extra_info('socket')
-            if not sock:
-                # This shouldn't happen
-                raise NatsError('unable to get socket')
-            yield from self._io_writer.drain()  # just in case something is left
+                  # Filter for any similar server in the server pool already
+                  for s in self._server_pool:
+                      if uri.netloc == s.uri.netloc:
+                          continue
+                  connect_urls.append(srv)
 
-            self._io_reader, self._io_writer = \
-                yield from asyncio.open_connection(
-                    loop=self._loop,
-                    limit=DEFAULT_BUFFER_SIZE,
-                    sock=sock,
-                    ssl=ssl_context,
-                    server_hostname=self._current_server.uri.hostname,
-                )
+              if self.options["dont_randomize"] is not True:
+                  shuffle(connect_urls)
+              for srv in connect_urls:
+                  self._server_pool.append(srv)
+
+          if self._server_info['tls_required']:
+              ssl_context = self.options.get('tls')
+              if not ssl_context:
+                  raise NatsError('no ssl context provided')
+
+              transport = self._io_writer.transport
+              sock = transport.get_extra_info('socket')
+              if not sock:
+                  # This shouldn't happen
+                  raise NatsError('unable to get socket')
+              yield from self._io_writer.drain()  # just in case something is left
+
+              self._io_reader, self._io_writer = \
+                  yield from asyncio.open_connection(
+                      loop=self._loop,
+                      limit=DEFAULT_BUFFER_SIZE,
+                      sock=sock,
+                      ssl=ssl_context,
+                      server_hostname=self._current_server.uri.hostname,
+                  )
 
 
-        # Refresh state of parser upon reconnect.
-        if self.is_reconnecting:
-            self._ps.reset()
+          # Refresh state of parser upon reconnect.
+          if self.is_reconnecting:
+              self._ps.reset()
 
-        connect_cmd = self._connect_command()
-        self._io_writer.write(connect_cmd)
-        self._io_writer.write(PING_PROTO)
-        yield from self._io_writer.drain()
+          connect_cmd = self._connect_command()
+          self._io_writer.write(connect_cmd)
+          self._io_writer.write(PING_PROTO)
+          yield from self._io_writer.drain()
 
-        # FIXME: Add readline timeout
-        next_op = yield from self._io_reader.readline()
-        if self.options["verbose"] and OK_OP in next_op:
-            next_op = yield from self._io_reader.readline()
+          # FIXME: Add readline timeout
+          next_op = yield from self._io_reader.readline()
+          if self.options["verbose"] and OK_OP in next_op:
+              next_op = yield from self._io_reader.readline()
 
-        if ERR_OP in next_op:
-            err_line = next_op.decode()
-            _, err_msg = err_line.split(" ", 1)
-            # FIXME: Maybe handling could be more special here,
-            # checking for ErrAuthorization for example.
-            # yield from self._process_err(err_msg)
-            raise NatsError("nats: " + err_msg.rstrip('\r\n'))
+          if ERR_OP in next_op:
+              err_line = next_op.decode()
+              _, err_msg = err_line.split(" ", 1)
+              # FIXME: Maybe handling could be more special here,
+              # checking for ErrAuthorization for example.
+              # yield from self._process_err(err_msg)
+              raise NatsError("nats: " + err_msg.rstrip('\r\n'))
 
-        if PONG_PROTO in next_op:
-            self._status = Client.CONNECTED
+          if PONG_PROTO in next_op:
+              self._status = Client.CONNECTED
 
-        self._reading_task = self._loop.create_task(self._read_loop())
-        self._pongs = []
-        self._pings_outstanding = 0
-        self._ping_interval_task = self._loop.create_task(self._ping_interval())
+          self._reading_task = self._loop.create_task(self._read_loop())
+          self._pongs = []
+          self._pings_outstanding = 0
+          self._ping_interval_task = self._loop.create_task(self._ping_interval())
 
-        # Task for kicking the flusher queue
-        self._flusher_task = self._loop.create_task(self._flusher())
+          # Task for kicking the flusher queue
+          self._flusher_task = self._loop.create_task(self._flusher())
 
     @asyncio.coroutine
     def _send_ping(self, future=None):

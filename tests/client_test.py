@@ -12,7 +12,8 @@ from nats.aio.utils  import new_inbox, INBOX_PREFIX
 from nats.aio.errors import ErrConnectionClosed, ErrNoServers, ErrTimeout, \
   ErrBadSubject, NatsError
 from tests.utils import async_test, start_gnatsd, NatsTestCase, \
-  SingleServerTestCase, MultiServerAuthTestCase, TLSServerTestCase, MultiTLSServerAuthTestCase
+  SingleServerTestCase, MultiServerAuthTestCase, TLSServerTestCase, \
+  MultiTLSServerAuthTestCase, ClusteringTestCase
 
 class ClientUtilsTest(NatsTestCase):
 
@@ -945,7 +946,58 @@ class ClientTLSReconnectTest(MultiTLSServerAuthTestCase):
     self.assertEqual(1, reconnected_count)
     self.assertEqual(1, err_count)
 
+class ClusterDiscoveryTest(ClusteringTestCase):
+
+  @async_test
+  def test_discover_servers_on_first_connect(self):
+    nc = NATS()
+
+    # Start rest of cluster members so that we receive them
+    # connect_urls on the first connect.
+    yield from self.loop.run_in_executor(None, self.server_pool[1].start)
+    yield from asyncio.sleep(1, loop=self.loop)
+    yield from self.loop.run_in_executor(None, self.server_pool[2].start)
+    yield from asyncio.sleep(1, loop=self.loop)
+
+    options = {
+      'servers': [
+        "nats://127.0.0.1:4223",
+        ],
+      'io_loop': self.loop
+      }
+    yield from nc.connect(**options)
+    self.assertTrue(nc.is_connected)
+    yield from nc.close()
+    self.assertTrue(nc.is_closed)
+    self.assertEqual(len(nc.servers), 3)
+    self.assertEqual(len(nc.discovered_servers), 2)
+
+  @async_test
+  def test_discover_servers_after_first_connect(self):
+    nc = NATS()
+
+    options = {
+      'servers': [
+        "nats://127.0.0.1:4223",
+        ],
+      'io_loop': self.loop
+      }
+    yield from nc.connect(**options)
+
+    # Start rest of cluster members so that we receive them
+    # connect_urls on the first connect.
+    yield from self.loop.run_in_executor(None, self.server_pool[1].start)
+    yield from asyncio.sleep(1, loop=self.loop)
+    yield from self.loop.run_in_executor(None, self.server_pool[2].start)
+    yield from asyncio.sleep(1, loop=self.loop)
+
+    yield from nc.close()
+    self.assertTrue(nc.is_closed)
+    self.assertEqual(len(nc.servers), 3)
+    self.assertEqual(len(nc.discovered_servers), 2)
+
 if __name__ == '__main__':
   runner = unittest.TextTestRunner(stream=sys.stdout)
   unittest.main(verbosity=2, exit=False, testRunner=runner)
+
 

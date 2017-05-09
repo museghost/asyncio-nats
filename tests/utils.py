@@ -18,6 +18,8 @@ class Gnatsd(object):
                http_port=8222,
                debug=False,
                tls=False,
+               cluster_listen=None,
+               routes=[]
             ):
     self.port = port
     self.user = user
@@ -27,13 +29,15 @@ class Gnatsd(object):
     self.proc = None
     self.debug = debug
     self.tls = tls
+    self.cluster_listen = cluster_listen
+    self.routes = routes
 
     env_debug_flag = os.environ.get("DEBUG_NATS_TEST")
     if env_debug_flag == "true":
       self.debug = True
 
   def start(self):
-    cmd = ["gnatsd", "-p", "%d" % self.port, "-m", "%d" % self.http_port]
+    cmd = ["gnatsd", "-p", "%d" % self.port, "-m", "%d" % self.http_port, "-a", "127.0.0.1"]
     if self.user != "":
       cmd.append("--user")
       cmd.append(self.user)
@@ -53,6 +57,14 @@ class Gnatsd(object):
       cmd.append('--tlsverify')
       cmd.append('--tlscacert')
       cmd.append('tests/certs/ca.pem')
+
+    if self.cluster_listen is not None:
+      cmd.append('--cluster_listen')
+      cmd.append(self.cluster_listen)
+
+    if len(self.routes) > 0:
+      cmd.append('--routes')
+      cmd.append(','.join(self.routes))
 
     if self.debug:
       self.proc = subprocess.Popen(cmd)
@@ -126,6 +138,37 @@ class MultiServerAuthTestCase(NatsTestCase):
   def tearDown(self):
     for gnatsd in self.server_pool:
       gnatsd.stop()
+    self.loop.close()
+
+class ClusteringTestCase(NatsTestCase):
+
+  def setUp(self):
+    super(ClusteringTestCase, self).setUp()
+    self.server_pool = []
+    self.loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(None)
+
+    routes = ["nats://127.0.0.1:6223", "nats://127.0.0.1:6224", "nats://127.0.0.1:6225"]
+    server1 = Gnatsd(port=4223, http_port=8223, cluster_listen="nats://127.0.0.1:6223", routes=routes)
+    self.server_pool.append(server1)
+
+    server2 = Gnatsd(port=4224, http_port=8224, cluster_listen="nats://127.0.0.1:6224", routes=routes)
+    self.server_pool.append(server2)
+
+    server3 = Gnatsd(port=4225, http_port=8225, cluster_listen="nats://127.0.0.1:6225", routes=routes)
+    self.server_pool.append(server3)
+
+    # We start with the first one only
+    for gnatsd in self.server_pool:
+      start_gnatsd(gnatsd)
+      break
+
+  def tearDown(self):
+    for gnatsd in self.server_pool:
+      try:
+        gnatsd.stop()
+      except:
+        pass
     self.loop.close()
 
 class TLSServerTestCase(NatsTestCase):
